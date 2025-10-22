@@ -15,10 +15,16 @@
 (define-constant err-insufficient-milestone-funds (err u113))
 (define-constant err-approval-required (err u114))
 (define-constant err-already-approved (err u115))
+(define-constant err-proposal-not-found (err u116))
+(define-constant err-proposal-ended (err u117))
+(define-constant err-already-voted (err u118))
+(define-constant err-proposal-not-ended (err u119))
+(define-constant err-insufficient-backing (err u120))
 
 (define-data-var next-campaign-id uint u1)
 (define-data-var total-campaigns uint u0)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-proposal-id uint u1)
 
 (define-map campaigns 
   uint 
@@ -63,6 +69,30 @@
 (define-map milestone-approvals
   {campaign-id: uint, milestone-id: uint, approver: principal}
   {approved: bool, timestamp: uint})
+
+(define-map proposals
+  {campaign-id: uint, proposal-id: uint}
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    proposal-type: (string-ascii 50),
+    creator: principal,
+    created-at: uint,
+    voting-ends: uint,
+    votes-for: uint,
+    votes-against: uint,
+    total-voting-power: uint,
+    is-executed: bool,
+    is-passed: bool
+  })
+
+(define-map proposal-votes
+  {campaign-id: uint, proposal-id: uint, voter: principal}
+  {
+    vote: bool,
+    voting-power: uint,
+    timestamp: uint
+  })
 
 (define-public (create-campaign (title (string-ascii 100)) (description (string-ascii 500)) (funding-target uint) (duration uint))
   (let ((campaign-id (var-get next-campaign-id))
@@ -381,3 +411,177 @@
 
 (define-read-only (get-next-milestone-id)
   (var-get next-milestone-id))
+
+(define-public (create-proposal
+  (campaign-id uint)
+  (title (string-ascii 100))
+  (description (string-ascii 500))
+  (proposal-type (string-ascii 50))
+  (voting-duration uint))
+  (let ((campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+        (backing (map-get? campaign-backers {campaign-id: campaign-id, backer: tx-sender}))
+        (proposal-id (var-get next-proposal-id))
+        (current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (voting-ends (+ current-block voting-duration)))
+    
+    (asserts! (get is-active campaign) err-campaign-ended)
+    (asserts! (or 
+      (is-eq tx-sender (get creator campaign))
+      (is-some backing)) 
+      err-insufficient-backing)
+    (asserts! (> voting-duration u0) err-invalid-amount)
+    
+    (map-set proposals
+      {campaign-id: campaign-id, proposal-id: proposal-id}
+      {
+        title: title,
+        description: description,
+        proposal-type: proposal-type,
+        creator: tx-sender,
+        created-at: current-block,
+        voting-ends: voting-ends,
+        votes-for: u0,
+        votes-against: u0,
+        total-voting-power: u0,
+        is-executed: false,
+        is-passed: false
+      })
+    
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)))
+
+(define-public (vote-on-proposal
+  (campaign-id uint)
+  (proposal-id uint)
+  (vote-for bool))
+  (let ((campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+        (proposal (unwrap! (map-get? proposals {campaign-id: campaign-id, proposal-id: proposal-id}) err-proposal-not-found))
+        (backing (unwrap! (map-get? campaign-backers {campaign-id: campaign-id, backer: tx-sender}) err-insufficient-backing))
+        (existing-vote (map-get? proposal-votes {campaign-id: campaign-id, proposal-id: proposal-id, voter: tx-sender}))
+        (current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    
+    (asserts! (< current-block (get voting-ends proposal)) err-proposal-ended)
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (> (get amount backing) u0) err-insufficient-backing)
+    
+    (let ((voting-power (calculate-voting-power (get amount backing) (get current-funding campaign)))
+          (new-votes-for (if vote-for (+ (get votes-for proposal) voting-power) (get votes-for proposal)))
+          (new-votes-against (if vote-for (get votes-against proposal) (+ (get votes-against proposal) voting-power)))
+          (new-total-power (+ (get total-voting-power proposal) voting-power)))
+      
+      (map-set proposals
+        {campaign-id: campaign-id, proposal-id: proposal-id}
+        (merge proposal
+          {
+            votes-for: new-votes-for,
+            votes-against: new-votes-against,
+            total-voting-power: new-total-power
+          }))
+      
+      (map-set proposal-votes
+        {campaign-id: campaign-id, proposal-id: proposal-id, voter: tx-sender}
+        {
+          vote: vote-for,
+          voting-power: voting-power,
+          timestamp: current-block
+        })
+      
+      (ok voting-power))))
+
+(define-public (execute-proposal
+  (campaign-id uint)
+  (proposal-id uint))
+  (let ((campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+        (proposal (unwrap! (map-get? proposals {campaign-id: campaign-id, proposal-id: proposal-id}) err-proposal-not-found))
+        (current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    
+    (asserts! (>= current-block (get voting-ends proposal)) err-proposal-not-ended)
+    (asserts! (not (get is-executed proposal)) err-already-approved)
+    
+    (let ((quorum-met (>= (get total-voting-power proposal) u5000))
+          (vote-passed (> (get votes-for proposal) (get votes-against proposal)))
+          (is-passed (and quorum-met vote-passed)))
+      
+      (map-set proposals
+        {campaign-id: campaign-id, proposal-id: proposal-id}
+        (merge proposal
+          {
+            is-executed: true,
+            is-passed: is-passed
+          }))
+      
+      (ok {
+        passed: is-passed,
+        votes-for: (get votes-for proposal),
+        votes-against: (get votes-against proposal),
+        quorum-met: quorum-met
+      }))))
+
+(define-private (calculate-voting-power (backing-amount uint) (total-funding uint))
+  (if (> total-funding u0)
+    (/ (* backing-amount u10000) total-funding)
+    u0))
+
+(define-read-only (get-proposal (campaign-id uint) (proposal-id uint))
+  (map-get? proposals {campaign-id: campaign-id, proposal-id: proposal-id}))
+
+(define-read-only (get-proposal-vote (campaign-id uint) (proposal-id uint) (voter principal))
+  (map-get? proposal-votes {campaign-id: campaign-id, proposal-id: proposal-id, voter: voter}))
+
+(define-read-only (get-voting-power (campaign-id uint) (backer principal))
+  (match (map-get? campaigns campaign-id)
+    campaign
+    (match (map-get? campaign-backers {campaign-id: campaign-id, backer: backer})
+      backing
+      (some (calculate-voting-power (get amount backing) (get current-funding campaign)))
+      none)
+    none))
+
+(define-read-only (get-proposal-results (campaign-id uint) (proposal-id uint))
+  (match (map-get? proposals {campaign-id: campaign-id, proposal-id: proposal-id})
+    proposal
+    (let ((total-votes (+ (get votes-for proposal) (get votes-against proposal))))
+      (some {
+        votes-for: (get votes-for proposal),
+        votes-against: (get votes-against proposal),
+        total-voting-power: (get total-voting-power proposal),
+        for-percentage: (if (> total-votes u0) (/ (* (get votes-for proposal) u10000) total-votes) u0),
+        against-percentage: (if (> total-votes u0) (/ (* (get votes-against proposal) u10000) total-votes) u0),
+        is-passed: (get is-passed proposal),
+        is-executed: (get is-executed proposal),
+        quorum-met: (>= (get total-voting-power proposal) u5000)
+      }))
+    none))
+
+(define-read-only (can-vote (campaign-id uint) (proposal-id uint) (voter principal))
+  (match (map-get? proposals {campaign-id: campaign-id, proposal-id: proposal-id})
+    proposal
+    (let ((current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+          (has-backing (is-some (map-get? campaign-backers {campaign-id: campaign-id, backer: voter})))
+          (already-voted (is-some (map-get? proposal-votes {campaign-id: campaign-id, proposal-id: proposal-id, voter: voter})))
+          (voting-open (< current-block (get voting-ends proposal))))
+      (some {
+        can-vote: (and has-backing (not already-voted) voting-open),
+        has-backing: has-backing,
+        already-voted: already-voted,
+        voting-open: voting-open
+      }))
+    none))
+
+(define-read-only (get-proposal-status (campaign-id uint) (proposal-id uint))
+  (match (map-get? proposals {campaign-id: campaign-id, proposal-id: proposal-id})
+    proposal
+    (let ((current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+          (voting-ended (>= current-block (get voting-ends proposal)))
+          (time-left (if voting-ended u0 (- (get voting-ends proposal) current-block))))
+      (some {
+        is-active: (not voting-ended),
+        is-executed: (get is-executed proposal),
+        is-passed: (get is-passed proposal),
+        time-remaining: time-left,
+        voting-ends: (get voting-ends proposal)
+      }))
+    none))
+
+(define-read-only (get-next-proposal-id)
+  (var-get next-proposal-id))
